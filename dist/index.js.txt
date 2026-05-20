@@ -1,0 +1,964 @@
+```javascript
+#!/usr/bin/env node
+/**
+ * Galactic Brain MCP Server v4
+ * Refactor complet du v3 — tous les P0/P1/P2/P3 traités.
+ */
+
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { z } from 'zod';
+import * as fs from 'fs/promises';
+import * as path from 'path';
+
+const VAULT_PATH = process.env.GALACTIC_VAULT_PATH || process.argv[2];
+const EXPORT_REL = process.env.GALACTIC_EXPORT_REL || 'GalacticBrain/_mcp_export.json';
+
+if (!VAULT_PATH) {
+  console.error('❌ Set GALACTIC_VAULT_PATH env var or pass vault path as first arg');
+  process.exit(1);
+}
+
+const VAULT_RESOLVED = path.resolve(VAULT_PATH);
+const EXPORT_PATH = path.join(VAULT_PATH, EXPORT_REL);
+
+// ── Path safety (P1) ─────────────────────────────────────
+function safeVaultPath(rel) {
+  if (typeof rel !== 'string' || rel.length === 0) {
+    throw new Error('Chemin invalide : doit être une string non vide');
+  }
+  if (path.isAbsolute(rel)) {
+    throw new Error(`Chemin absolu refusé : "${rel}"`);
+  }
+  const abs = path.resolve(VAULT_RESOLVED, rel);
+  if (abs !== VAULT_RESOLVED && !abs.startsWith(VAULT_RESOLVED + path.sep)) {
+    throw new Error(`Chemin sort du vault : "${rel}"`);
+  }
+  return abs;
+}
+
+let dataCache = null;
+let indexCache = null;
+let indexDirty = false;
+
+async function loadData() {
+  try {
+    const stat = await fs.stat(EXPORT_PATH);
+    if (dataCache && dataCache.mtime === stat.mtimeMs) return dataCache.data;
+    const raw = await fs.readFile(EXPORT_PATH, 'utf-8');
+    const data = JSON.parse(raw);
+    dataCache = { mtime: stat.mtimeMs, data };
+    return data;
+  } catch (e) {
+    throw new Error(`Cannot read export at ${EXPORT_PATH}: ${e.message}\nDid you run "Sync" + "🧠 Claude" in Obsidian?`);
+  }
+}
+
+async function readNote(notePath) {
+  try { return await fs.readFile(safeVaultPath(notePath), 'utf-8'); }
+  catch { return null; }
+}
+
+async function writeNote(notePath, content) {
+  const full = safeVaultPath(notePath);
+  await fs.mkdir(path.dirname(full), { recursive: true });
+  await fs.writeFile(full, content, 'utf-8');
+  indexDirty = true;
+}
+
+async function deleteFile(notePath) {
+  await fs.unlink(safeVaultPath(notePath));
+  indexDirty = true;
+}
+
+async function noteExists(notePath) {
+  try { await fs.access(safeVaultPath(notePath)); return true; }
+  catch { return false; }
+}
+
+function nowIso() { return new Date().toISOString(); }
+function todayDate() { return new Date().toISOString().slice(0, 10); }
+
+function escapeMd(s) {
+  return String(s ?? '')
+    .replace(/\r?\n/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/\|/g, '\\|')
+    .trim();
+}
+
+function slug(title) {
+  const s = String(title ?? '')
+    .toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 60);
+  return s.length > 0 ? s : `note-${Date.now().toString(36)}`;
+}
+
+async function resolveRepo(name) {
+  const data = await loadData();
+  const repo = data.repos.find(r =>
+    r.name === name || r.name.toLowerCase() === String(name).toLowerCase()
+  );
+  if (!repo) {
+    const closest = data.repos.slice(0, 10).map(r => r.name).join(', ');
+    throw new Error(`Repo "${name}" introuvable. Premières options: ${closest}`);
+  }
+  const notesFolder = path.dirname(repo.note_path).split(path.sep).join('/');
+  return {
+    repo,
+    settings: {
+      notesFolder,
+      claudeFolder: `${notesFolder}/_claude`,
+      improvementsFolder: `${notesFolder}/_improvements`,
+    },
+  };
+}
+
+function parseFrontmatter(content) {
+  if (!content.startsWith('---\n')) return { fm: {}, body: content };
+  const lines = content.split('\n');
+  let endIdx = -1;
+  for (let i = 1; i < lines.length; i++) {
+    if (lines[i] === '---') { endIdx = i; break; }
+  }
+  if (endIdx === -1) return { fm: {}, body: content };
+  const fm = {};
+  for (let i = 1; i < endIdx; i++) {
+    const m = lines[i].match(/^([a-zA-Z_][a-zA-Z0-9_-]*):\s*(.*)$/);
+    if (!m) continue;
+    let val = m[2].trim();
+    if (val.startsWith('[') && val.endsWith(']')) {
+      val = val.slice(1, -1).split(',').map(s => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
+    } else if (val.startsWith('"') && val.endsWith('"')) {
+      val = val.slice(1, -1);
+    }
+    fm[m[1]] = val;
+  }
+  const body = lines.slice(endIdx + 1).join('\n');
+  return { fm, body };
+}
+
+function buildFrontmatter(fm) {
+  const lines = ['---'];
+  for (const [k, v] of Object.entries(fm)) {
+    if (v == null) continue;
+    if (Array.isArray(v)) {
+      lines.push(`${k}: [${v.map(s => JSON.stringify(s)).join(', ')}]`);
+    } else if (typeof v === 'string' && /[:#"'\[\]]/.test(v)) {
+      lines.push(`${k}: ${JSON.stringify(v)}`);
+    } else {
+      lines.push(`${k}: ${v}`);
+    }
+  }
+  lines.push('---');
+  return lines.join('\n') + '\n';
+}
+
+function splitNote(content) {
+  const lines = content.split('\n');
+  const chunks = [];
+  let currentHeading = '_intro';
+  let currentBody = [];
+  for (const line of lines) {
+    const m = line.match(/^##\s+(.*)/);
+    if (m) {
+      if (currentBody.length > 0) chunks.push({ heading: currentHeading, body: currentBody.join('\n').trim() });
+      currentHeading = m[1].trim();
+      currentBody = [];
+    } else {
+      currentBody.push(line);
+    }
+  }
+  if (currentBody.length > 0) chunks.push({ heading: currentHeading, body: currentBody.join('\n').trim() });
+  const out = [];
+  for (const c of chunks) {
+    if (c.body.length <= 1500) { out.push(c); continue; }
+    const paras = c.body.split(/\n\n+/);
+    let buf = [], len = 0;
+    for (const p of paras) {
+      if (len + p.length > 1200 && buf.length > 0) {
+        out.push({ heading: c.heading, body: buf.join('\n\n') });
+        buf = []; len = 0;
+      }
+      buf.push(p); len += p.length;
+    }
+    if (buf.length > 0) out.push({ heading: c.heading, body: buf.join('\n\n') });
+  }
+  return out;
+}
+
+const STOP = new Set([
+  'le','la','les','de','des','un','une','et','ou','à','en','dans','sur','pour',
+  'avec','par','que','qui','est','ce','cette','ces','mes','mon','ma','tu','je',
+  'il','elle','nous','vous','ils','elles','the','an','of','to','in','for','on',
+  'with','as','at','by','this','that','is','are','was','were','be','been'
+]);
+function tokenize(s) {
+  return s.toLowerCase()
+    .replace(/[^\p{L}\p{N}_\-+#]+/gu, ' ')
+    .split(/\s+/)
+    .filter(w => w.length >= 1 && !STOP.has(w));
+}
+
+async function buildIndex() {
+  const stat = await fs.stat(EXPORT_PATH);
+  if (indexCache && !indexDirty && indexCache.mtime === stat.mtimeMs) return indexCache.index;
+  const data = await loadData();
+  const chunks = [];
+  for (const repo of data.repos) {
+    const note = await readNote(repo.note_path);
+    if (!note) continue;
+    for (const sec of splitNote(note)) {
+      const text = sec.body.length > 600 ? sec.body.slice(0, 600) : sec.body;
+      chunks.push({
+        repo: repo.name, notePath: repo.note_path, section: sec.heading, text,
+        keywords: tokenize(text + ' ' + repo.name + ' ' + (repo.description ?? '')),
+      });
+    }
+  }
+  const claudeBase = 'GalacticBrain/_claude';
+  try {
+    const dirs = await fs.readdir(safeVaultPath(claudeBase)).catch(() => []);
+    for (const sub of dirs) {
+      const subRel = `${claudeBase}/${sub}`;
+      const stat2 = await fs.stat(safeVaultPath(subRel)).catch(() => null);
+      if (!stat2?.isDirectory()) continue;
+      const files = await fs.readdir(safeVaultPath(subRel)).catch(() => []);
+      for (const f of files) {
+        if (!f.endsWith('.md')) continue;
+        const rel = `${subRel}/${f}`;
+        const note = await readNote(rel);
+        if (!note) continue;
+        for (const sec of splitNote(note)) {
+          const text = sec.body.length > 600 ? sec.body.slice(0, 600) : sec.body;
+          chunks.push({
+            repo: sub, notePath: rel, section: `[satellite] ${sec.heading}`, text,
+            keywords: tokenize(text + ' ' + sub + ' ' + f),
+          });
+        }
+      }
+    }
+  } catch {}
+  const index = { chunks };
+  indexCache = { mtime: stat.mtimeMs, index };
+  indexDirty = false;
+  return index;
+}
+
+async function smartSearch(query, limit = 5) {
+  const index = await buildIndex();
+  const queryTokens = tokenize(query);
+  if (queryTokens.length === 0) return [];
+  const df = {};
+  for (const c of index.chunks) {
+    const seen = new Set(c.keywords);
+    for (const k of seen) df[k] = (df[k] ?? 0) + 1;
+  }
+  const N = index.chunks.length || 1;
+  const scored = index.chunks.map(c => {
+    let score = 0;
+    for (const q of queryTokens) {
+      const tf = c.keywords.filter(k => k === q || k.includes(q)).length;
+      if (tf === 0) continue;
+      const idf = Math.log((N + 1) / ((df[q] ?? 0) + 1));
+      score += tf * idf;
+    }
+    const lcText = c.text.toLowerCase();
+    for (const q of queryTokens) if (lcText.includes(q)) score += 2;
+    return { c, score };
+  }).filter(x => x.score > 0).sort((a, b) => b.score - a.score).slice(0, limit);
+  return scored.map(({ c, score }) => ({
+    repo: c.repo, section: c.section,
+    score: Math.round(score * 100) / 100,
+    notePath: c.notePath,
+    excerpt: c.text.length > 280 ? c.text.slice(0, 280) + '…' : c.text,
+  }));
+}
+
+async function resolveWriteConflict(filePath, strategy = 'error') {
+  const existed = await noteExists(filePath);
+  if (!existed) return { finalPath: filePath, mode: 'create', existed: false };
+  if (strategy === 'overwrite') return { finalPath: filePath, mode: 'overwrite', existed: true };
+  if (strategy === 'append')    return { finalPath: filePath, mode: 'append', existed: true };
+  if (strategy === 'version') {
+    const parsed = path.parse(filePath);
+    for (let i = 2; i < 100; i++) {
+      const candidate = `${parsed.dir}/${parsed.name}-${i}${parsed.ext}`;
+      if (!(await noteExists(candidate))) {
+        return { finalPath: candidate, mode: 'create', existed: true };
+      }
+    }
+    throw new Error('Trop de versions du même fichier (>100), abandon.');
+  }
+  const e = new Error(`Le fichier existe déjà : ${filePath}. Utilisez conflict_strategy: 'overwrite' | 'append' | 'version', ou update_satellite.`);
+  e.code = 'EEXIST';
+  throw e;
+}
+
+const VERSION = '4.0.0';
+const server = new McpServer({ name: 'galactic-brain', version: VERSION },
+  { capabilities: { tools: {} } });
+
+// ─────────────── READ TOOLS ───────────────
+
+server.registerTool('user_summary', {
+  title: 'User profile overview',
+  description: 'CHEAP. Always call this FIRST. ~50 tokens.',
+  inputSchema: {},
+}, async () => {
+  const data = await loadData();
+  const u = data.user_summary;
+  return { content: [{ type: 'text', text: `# ${data.github_username}
+${u.total_repos} repos · ${u.total_stars}⭐ · top: **${u.most_used_language}** · most active: **${u.most_active_repo}**
+${u.languages_count} languages · synced ${new Date(data.generated_at).toLocaleDateString('fr-FR')}` }] };
+});
+
+server.registerTool('list_repos', {
+  title: 'List repos (compact)',
+  description: 'One-liner per repo.',
+  inputSchema: {
+    sort_by: z.enum(['stars', 'updated', 'name']).optional(),
+    language: z.string().optional(),
+    limit: z.number().int().min(1).max(50).optional(),
+  },
+}, async (args) => {
+  const data = await loadData();
+  let repos = data.repos;
+  if (args.language) repos = repos.filter(r => r.language === args.language);
+  if (args.sort_by === 'stars') repos = [...repos].sort((a, b) => b.stars - a.stars);
+  else if (args.sort_by === 'name') repos = [...repos].sort((a, b) => a.name.localeCompare(b.name));
+  else repos = [...repos].sort((a, b) => b.last_pushed.localeCompare(a.last_pushed));
+  repos = repos.slice(0, args.limit ?? 20);
+  const lines = repos.map(r =>
+    `- **${r.name}** [${r.language ?? '?'}] ⭐${r.stars} ${r.topics.slice(0,3).map(t=>'#'+t).join(' ')}`
+    + (r.description ? `\n  ${r.description.slice(0, 100)}${r.description.length > 100 ? '…' : ''}` : '')
+  );
+  return { content: [{ type: 'text', text: `${repos.length} repos:\n\n${lines.join('\n')}` }] };
+});
+
+server.registerTool('get_repo_summary', {
+  title: 'Get repo summary',
+  description: 'Metrics + stack + recent commits ONLY.',
+  inputSchema: { name: z.string() },
+}, async (args) => {
+  const { repo } = await resolveRepo(args.name);
+  const note = await readNote(repo.note_path);
+  const sections = note ? splitNote(note) : [];
+  const wanted = sections.filter(s => /Métriques|Stack technique|Timeline/.test(s.heading));
+  const compact = wanted.map(s => `## ${s.heading}\n${s.body.slice(0, 500)}`).join('\n\n');
+  return { content: [{ type: 'text', text:
+    `# ${repo.name}\n${repo.description}\n${repo.language ? `Language: ${repo.language}` : ''} · ⭐${repo.stars}\n\n${compact || 'No detailed note yet.'}` }] };
+});
+
+server.registerTool('get_repo_section', {
+  title: 'Read ONE section of a repo note',
+  description: 'Returns only the requested section.',
+  inputSchema: { name: z.string(), section: z.string() },
+}, async (args) => {
+  const { repo } = await resolveRepo(args.name);
+  const note = await readNote(repo.note_path);
+  if (!note) return { content: [{ type: 'text', text: `❌ Note non trouvée pour ${repo.name}.` }], isError: true };
+  const sections = splitNote(note);
+  const q = args.section.toLowerCase();
+  const matches = sections.filter(s => s.heading.toLowerCase().includes(q));
+  if (matches.length === 0) {
+    return { content: [{ type: 'text', text: `Section "${args.section}" non trouvée. Disponibles: ${sections.map(s => `"${s.heading}"`).join(', ')}` }] };
+  }
+  const text = matches.map(s => `## ${s.heading}\n\n${s.body}`).join('\n\n---\n\n');
+  return { content: [{ type: 'text', text: text.slice(0, 4000) }] };
+});
+
+server.registerTool('get_repo_full', {
+  title: 'Read entire repo note',
+  description: 'EXPENSIVE in tokens.',
+  inputSchema: { name: z.string() },
+}, async (args) => {
+  const { repo } = await resolveRepo(args.name);
+  const note = await readNote(repo.note_path);
+  return { content: [{ type: 'text', text: note ?? '❌ Note non disponible.' }] };
+});
+
+server.registerTool('search_brain', {
+  title: 'Smart search across all notes',
+  description: 'TF-IDF ranked search.',
+  inputSchema: { query: z.string(), limit: z.number().int().min(1).max(10).optional() },
+}, async (args) => {
+  const results = await smartSearch(args.query, args.limit ?? 5);
+  if (results.length === 0) return { content: [{ type: 'text', text: `Aucun résultat pour "${args.query}"` }] };
+  const lines = results.map((r, i) =>
+    `### ${i + 1}. **${r.repo}** > ${r.section} _(score ${r.score})_\n> ${r.excerpt}\n_path: ${r.notePath}_`
+  );
+  return { content: [{ type: 'text', text: `${results.length} matches:\n\n${lines.join('\n\n')}` }] };
+});
+
+server.registerTool('get_stack', {
+  title: 'Tech stack breakdown',
+  description: "Tech stack by category. ~200 tokens.",
+  inputSchema: {
+    category: z.enum(['frontend', 'backend', 'database', 'devops', 'ml', 'mobile', 'tooling', 'language', 'other']).optional(),
+  },
+}, async (args) => {
+  const data = await loadData();
+  let stack = data.stack;
+  if (args.category) stack = stack.filter(s => s.category === args.category);
+  const grouped = {};
+  stack.forEach(s => { (grouped[s.category] ??= []).push(s); });
+  const lines = [];
+  for (const [cat, items] of Object.entries(grouped)) {
+    lines.push(`\n**${cat.toUpperCase()}**: ${items.map(t => `${t.icon}${t.name}(×${t.count})`).join(' · ')}`);
+  }
+  return { content: [{ type: 'text', text: `# Stack ${data.github_username}${lines.join('')}` }] };
+});
+
+server.registerTool('get_topics', {
+  title: 'Cross-cutting topics',
+  description: 'Topics shared between ≥2 repos.',
+  inputSchema: { min_repos: z.number().int().min(1).optional() },
+}, async (args) => {
+  const data = await loadData();
+  const min = args.min_repos ?? 2;
+  const items = data.topic_constellations
+    .filter(c => c.repo_names.length >= min)
+    .sort((a, b) => b.repo_names.length - a.repo_names.length);
+  if (items.length === 0) return { content: [{ type: 'text', text: 'No shared topics.' }] };
+  const lines = items.map(c => `- **#${c.topic}**: ${c.repo_names.join(', ')}`);
+  return { content: [{ type: 'text', text: `${items.length} shared topics:\n${lines.join('\n')}` }] };
+});
+
+server.registerTool('read_note', {
+  title: 'Read a vault note by path',
+  description: 'Vault-relative paths only — absolute paths and `..` refused.',
+  inputSchema: { path: z.string() },
+}, async (args) => {
+  try {
+    const note = await readNote(args.path);
+    if (!note) return { content: [{ type: 'text', text: `❌ Note "${args.path}" introuvable.` }], isError: true };
+    return { content: [{ type: 'text', text: note.length > 8000 ? note.slice(0, 8000) + '\n\n_(truncated)_' : note }] };
+  } catch (e) {
+    return { content: [{ type: 'text', text: `❌ ${e.message}` }], isError: true };
+  }
+});
+
+server.registerTool('get_recent_activity', {
+  title: 'What moved recently',
+  description: 'Repos with commits in the last N days.',
+  inputSchema: { days: z.number().int().min(1).max(90).optional() },
+}, async (args) => {
+  const data = await loadData();
+  const days = args.days ?? 7;
+  const cutoff = Date.now() - days * 86400000;
+  const active = data.repos
+    .filter(r => new Date(r.last_pushed).getTime() > cutoff)
+    .sort((a, b) => b.last_pushed.localeCompare(a.last_pushed));
+  if (active.length === 0) return { content: [{ type: 'text', text: `Aucun repo actif depuis ${days} jours.` }] };
+  const lines = active.map(r => {
+    const d = Math.floor((Date.now() - new Date(r.last_pushed).getTime()) / 86400000);
+    return `- **${r.name}** [${r.language ?? '?'}] — il y a ${d}j`;
+  });
+  return { content: [{ type: 'text', text: `${active.length} repos actifs sur ${days}j:\n\n${lines.join('\n')}` }] };
+});
+
+server.registerTool('find_similar_repos', {
+  title: 'Find repos similar to a given one',
+  description: 'Repos sharing language or topics.',
+  inputSchema: { name: z.string(), limit: z.number().int().min(1).max(10).optional() },
+}, async (args) => {
+  const { repo: target } = await resolveRepo(args.name);
+  const data = await loadData();
+  const targetTopics = new Set(target.topics);
+  const scored = data.repos
+    .filter(r => r.id !== target.id)
+    .map(r => {
+      let score = 0;
+      if (r.language && r.language === target.language) score += 3;
+      r.topics.forEach(t => { if (targetTopics.has(t)) score += 2; });
+      return { r, score };
+    })
+    .filter(x => x.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, args.limit ?? 5);
+  if (scored.length === 0) return { content: [{ type: 'text', text: `Aucun repo similaire à "${args.name}".` }] };
+  const lines = scored.map(({ r, score }) => {
+    const shared = r.topics.filter(t => targetTopics.has(t));
+    return `- **${r.name}** _(score ${score})_ — ${r.language ?? '?'} ${shared.length ? `· shared: ${shared.join(',')}` : ''}`;
+  });
+  return { content: [{ type: 'text', text: `Repos similaires à **${target.name}**:\n\n${lines.join('\n')}` }] };
+});
+
+server.registerTool('compose_brief', {
+  title: 'Compose a focused brief',
+  description: 'Top-N hits par repo.',
+  inputSchema: {
+    subject: z.string(),
+    max_repos: z.number().int().min(1).max(8).optional(),
+    hits_per_repo: z.number().int().min(1).max(3).optional(),
+  },
+}, async (args) => {
+  const max = args.max_repos ?? 4;
+  const perRepo = args.hits_per_repo ?? 2;
+  const results = await smartSearch(args.subject, max * 5);
+  if (results.length === 0) return { content: [{ type: 'text', text: `Pas de matériel sur "${args.subject}".` }] };
+  const byRepo = new Map();
+  for (const r of results) {
+    if (!byRepo.has(r.repo)) byRepo.set(r.repo, []);
+    if (byRepo.get(r.repo).length < perRepo) byRepo.get(r.repo).push(r);
+  }
+  const top = Array.from(byRepo.entries()).slice(0, max);
+  const lines = [`# Brief: ${args.subject}\n`];
+  for (const [repo, hits] of top) {
+    lines.push(`## ${repo}`);
+    for (const h of hits) {
+      lines.push(`### ${h.section} _(score ${h.score})_`);
+      lines.push(`> ${h.excerpt}`);
+    }
+    lines.push('');
+  }
+  lines.push(`_${results.length} matches across ${byRepo.size} repos._`);
+  return { content: [{ type: 'text', text: lines.join('\n') }] };
+});
+
+// ─────────────── WRITE TOOLS ───────────────
+
+server.registerTool('add_improvement', {
+  title: 'Add an improvement',
+  description: 'Append an actionable improvement.',
+  inputSchema: {
+    repo: z.string(), title: z.string(), rationale: z.string(),
+    priority: z.enum(['critical', 'high', 'medium', 'low']),
+    category: z.enum(['perf', 'security', 'ux', 'code-quality', 'testing', 'docs', 'feature', 'bug', 'devops', 'architecture']),
+    effort: z.enum(['<1h', '1-4h', '1d', '2-3d', '1w']).optional(),
+  },
+}, async (args) => {
+  const { repo, settings } = await resolveRepo(args.repo);
+  const filePath = `${settings.improvementsFolder}/${repo.name}.md`;
+  let existing = await readNote(filePath);
+  if (!existing) {
+    existing = `---
+parent_repo: ${repo.name}
+kind: improvements
+generated_by: claude
+---
+
+# ⚙️ Améliorations — ${repo.name}
+
+| Statut | Priorité | Catégorie | Effort | Titre | Rationale | Ajoutée le |
+|--------|----------|-----------|--------|-------|-----------|------------|
+`;
+  }
+  const effort = args.effort ?? '1d';
+  const row = `| [ ] | ${args.priority} | ${args.category} | ${effort} | ${escapeMd(args.title)} | ${escapeMd(args.rationale)} | ${todayDate()} |`;
+  await writeNote(filePath, existing + row + '\n');
+  return { content: [{ type: 'text', text: `✓ Amélioration ajoutée à ${filePath}` }] };
+});
+
+server.registerTool('check_improvement', {
+  title: 'Mark an improvement as done',
+  description: 'Find by partial title match and mark [x].',
+  inputSchema: { repo: z.string(), title_match: z.string(), resolution: z.string().optional() },
+}, async (args) => {
+  const { repo, settings } = await resolveRepo(args.repo);
+  const filePath = `${settings.improvementsFolder}/${repo.name}.md`;
+  const existing = await readNote(filePath);
+  if (!existing) return { content: [{ type: 'text', text: `❌ Pas d'améliorations pour ${repo.name}.` }], isError: true };
+  const lines = existing.split('\n');
+  let matchIdx = -1;
+  const needle = args.title_match.toLowerCase();
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.startsWith('| [ ]') && !line.startsWith('| [x]')) continue;
+    if (line.toLowerCase().includes(needle)) { matchIdx = i; break; }
+  }
+  if (matchIdx < 0) return { content: [{ type: 'text', text: `❌ Aucune amélioration ne contient "${args.title_match}".` }], isError: true };
+  lines[matchIdx] = lines[matchIdx].replace('| [ ] |', '| [x] |');
+  if (args.resolution) lines[matchIdx] += ` <!-- ${todayDate()}: ${escapeMd(args.resolution)} -->`;
+  await writeNote(filePath, lines.join('\n'));
+  return { content: [{ type: 'text', text: `✓ Coché : ${args.title_match}` }] };
+});
+
+server.registerTool('list_improvements', {
+  title: 'List improvements',
+  description: 'Read the improvements file.',
+  inputSchema: { repo: z.string(), only_open: z.boolean().optional() },
+}, async (args) => {
+  const { repo, settings } = await resolveRepo(args.repo);
+  const filePath = `${settings.improvementsFolder}/${repo.name}.md`;
+  const existing = await readNote(filePath);
+  if (!existing) return { content: [{ type: 'text', text: `Aucune amélioration enregistrée pour ${repo.name}.` }] };
+  const lines = existing.split('\n');
+  const open = lines.filter(l => l.startsWith('| [ ]')).length;
+  const done = lines.filter(l => l.startsWith('| [x]')).length;
+  const onlyOpen = args.only_open ?? true;
+  const rows = lines.filter(l => onlyOpen ? l.startsWith('| [ ]') : (l.startsWith('| [ ]') || l.startsWith('| [x]')));
+  return { content: [{ type: 'text', text:
+    `# Améliorations ${repo.name}\n\n${open} ouverte(s) · ${done} faite(s)\n\n` +
+    `| Statut | Priorité | Catégorie | Effort | Titre | Rationale | Ajoutée le |\n` +
+    `|--------|----------|-----------|--------|-------|-----------|------------|\n` +
+    rows.join('\n') }] };
+});
+
+server.registerTool('delete_improvement', {
+  title: 'Remove an improvement',
+  description: 'Permanently removes a row by partial title match.',
+  inputSchema: { repo: z.string(), title_match: z.string() },
+}, async (args) => {
+  const { repo, settings } = await resolveRepo(args.repo);
+  const filePath = `${settings.improvementsFolder}/${repo.name}.md`;
+  const existing = await readNote(filePath);
+  if (!existing) return { content: [{ type: 'text', text: `❌ Pas d'améliorations pour ${repo.name}.` }], isError: true };
+  const lines = existing.split('\n');
+  const needle = args.title_match.toLowerCase();
+  const before = lines.length;
+  const filtered = lines.filter(l => {
+    const isRow = l.startsWith('| [ ]') || l.startsWith('| [x]');
+    return !(isRow && l.toLowerCase().includes(needle));
+  });
+  const removed = before - filtered.length;
+  if (removed === 0) return { content: [{ type: 'text', text: `❌ Aucune ligne ne contient "${args.title_match}".` }], isError: true };
+  await writeNote(filePath, filtered.join('\n'));
+  return { content: [{ type: 'text', text: `✓ ${removed} ligne(s) supprimée(s) du backlog ${repo.name}` }] };
+});
+
+server.registerTool('add_conversation', {
+  title: 'Persist a conversation insight',
+  description: 'Saves a Q/A insight as a satellite note.',
+  inputSchema: {
+    repo: z.string(), title: z.string(), summary: z.string(),
+    body: z.string().optional(), tags: z.array(z.string()).optional(),
+    conflict_strategy: z.enum(['error', 'overwrite', 'append', 'version']).optional(),
+  },
+}, async (args) => {
+  const { repo, settings } = await resolveRepo(args.repo);
+  const filePath = `${settings.claudeFolder}/${repo.name}/${todayDate()}-${slug(args.title)}.md`;
+  const tags = (args.tags ?? []).concat(['claude', 'conversation', `repo/${repo.name}`]);
+  const newContent = buildFrontmatter({
+    parent_repo: repo.name, kind: 'conversation', created: nowIso(), tags,
+  }) + `\n# 💬 ${args.title}\n\n> ${escapeMd(args.summary)}\n\n${args.body ?? ''}\n`;
+  try {
+    const { finalPath, mode } = await resolveWriteConflict(filePath, args.conflict_strategy ?? 'error');
+    if (mode === 'append') {
+      const prev = (await readNote(finalPath)) ?? '';
+      await writeNote(finalPath, prev + `\n\n---\n\n## Update ${nowIso()}\n\n> ${escapeMd(args.summary)}\n\n${args.body ?? ''}\n`);
+    } else {
+      await writeNote(finalPath, newContent);
+    }
+    return { content: [{ type: 'text', text: `✓ Conversation persistée : ${finalPath}` }] };
+  } catch (e) {
+    return { content: [{ type: 'text', text: `❌ ${e.message}` }], isError: true };
+  }
+});
+
+server.registerTool('add_reflection', {
+  title: 'Save a strategic reflection',
+  description: 'Deep insights about architecture, design.',
+  inputSchema: {
+    repo: z.string(), title: z.string(), insight: z.string(),
+    implications: z.array(z.string()).optional(),
+    conflict_strategy: z.enum(['error', 'overwrite', 'append', 'version']).optional(),
+  },
+}, async (args) => {
+  const { repo, settings } = await resolveRepo(args.repo);
+  const filePath = `${settings.claudeFolder}/${repo.name}/${todayDate()}-reflection-${slug(args.title)}.md`;
+  const impl = (args.implications ?? []).map(i => `- ${i}`).join('\n');
+  const newContent = buildFrontmatter({
+    parent_repo: repo.name, kind: 'reflection', created: nowIso(),
+    tags: ['claude', 'reflection', 'architecture', `repo/${repo.name}`],
+  }) + `\n# 🧠 ${args.title}\n\n${args.insight}\n\n${impl ? `## Implications\n\n${impl}\n` : ''}`;
+  try {
+    const { finalPath, mode } = await resolveWriteConflict(filePath, args.conflict_strategy ?? 'error');
+    if (mode === 'append') {
+      const prev = (await readNote(finalPath)) ?? '';
+      await writeNote(finalPath, prev + `\n\n---\n\n## Update ${nowIso()}\n\n${args.insight}\n${impl ? `\n${impl}\n` : ''}`);
+    } else {
+      await writeNote(finalPath, newContent);
+    }
+    return { content: [{ type: 'text', text: `✓ Réflexion enregistrée : ${finalPath}` }] };
+  } catch (e) {
+    return { content: [{ type: 'text', text: `❌ ${e.message}` }], isError: true };
+  }
+});
+
+server.registerTool('save_session', {
+  title: 'Save the current session',
+  description: 'CALL ONLY when user explicitly asks.',
+  inputSchema: {
+    repo: z.string(),
+    actions: z.array(z.string()),
+    remarks: z.array(z.string()).optional(),
+    improvements: z.array(z.string()).optional(),
+  },
+}, async (args) => {
+  const { repo, settings } = await resolveRepo(args.repo);
+  const filePath = `Projets/${repo.name}/Suivi.md`;
+  const existing = (await readNote(filePath)) ?? `---
+parent_repo: ${repo.name}
+kind: session_log
+---
+
+`;
+  let insertAt = 0;
+  const fmEnd = existing.indexOf('\n---\n', 4);
+  if (existing.startsWith('---\n') && fmEnd > 0) insertAt = fmEnd + 5;
+  const session = `## Session du ${todayDate()} — ${nowIso().slice(11, 16)}
+
+### 🔹 Actions / décisions
+${args.actions.map(a => `- ${a}`).join('\n')}
+
+${args.remarks?.length ? `### 🔹 Remarques & blocages\n${args.remarks.map(r => `- ${r}`).join('\n')}\n\n` : ''}${args.improvements?.length ? `### 🔹 Améliorations potentielles\n${args.improvements.map(i => `- ${i}`).join('\n')}\n\n` : ''}---
+
+`;
+  const newContent = existing.slice(0, insertAt) + session + existing.slice(insertAt);
+  await writeNote(filePath, newContent);
+  let satellite = `${settings.claudeFolder}/${repo.name}/${todayDate()}-session.md`;
+  const { finalPath } = await resolveWriteConflict(satellite, 'version');
+  satellite = finalPath;
+  await writeNote(satellite, buildFrontmatter({
+    parent_repo: repo.name, kind: 'session', created: nowIso(), mirror_of: filePath,
+  }) + '\n' + session);
+  return { content: [{ type: 'text', text: `✓ Session sauvegardée\n  → ${filePath}\n  → ${satellite}` }] };
+});
+
+server.registerTool('create_satellite_note', {
+  title: 'Create an arbitrary satellite note',
+  description: 'Generic write.',
+  inputSchema: {
+    repo: z.string(), title: z.string(), content: z.string(),
+    kind: z.string().optional(),
+    tags: z.array(z.string()).optional(),
+    conflict_strategy: z.enum(['error', 'overwrite', 'append', 'version']).optional(),
+  },
+}, async (args) => {
+  const { repo, settings } = await resolveRepo(args.repo);
+  const kind = args.kind ?? 'note';
+  const filePath = `${settings.claudeFolder}/${repo.name}/${todayDate()}-${kind}-${slug(args.title)}.md`;
+  const tags = (args.tags ?? []).concat(['claude', kind, `repo/${repo.name}`]);
+  const fullContent = buildFrontmatter({
+    parent_repo: repo.name, kind, created: nowIso(), tags,
+  }) + `\n# ${args.title}\n\n${args.content}\n`;
+  try {
+    const { finalPath } = await resolveWriteConflict(filePath, args.conflict_strategy ?? 'error');
+    await writeNote(finalPath, fullContent);
+    return { content: [{ type: 'text', text: `✓ Note satellite créée : ${finalPath}` }] };
+  } catch (e) {
+    return { content: [{ type: 'text', text: `❌ ${e.message}` }], isError: true };
+  }
+});
+
+server.registerTool('update_satellite', {
+  title: 'Update an existing satellite',
+  description: 'Replace body of existing satellite.',
+  inputSchema: {
+    path: z.string().optional(),
+    repo: z.string().optional(),
+    slug: z.string().optional(),
+    title: z.string().optional(),
+    content: z.string(),
+    add_tags: z.array(z.string()).optional(),
+  },
+}, async (args) => {
+  let target = args.path;
+  if (!target) {
+    if (!args.repo || !args.slug) return { content: [{ type: 'text', text: '❌ Fournir soit `path`, soit (`repo` + `slug`).' }], isError: true };
+    const { repo, settings } = await resolveRepo(args.repo);
+    const dir = `${settings.claudeFolder}/${repo.name}`;
+    let files = [];
+    try { files = await fs.readdir(safeVaultPath(dir)); }
+    catch { return { content: [{ type: 'text', text: `❌ Pas de dossier satellite pour ${repo.name}.` }], isError: true }; }
+    const needle = args.slug.toLowerCase();
+    const matches = files.filter(f => f.endsWith('.md') && f.toLowerCase().includes(needle));
+    if (matches.length === 0) return { content: [{ type: 'text', text: `❌ Aucun satellite ne matche "${args.slug}".\nFichiers : ${files.join(', ')}` }], isError: true };
+    if (matches.length > 1) return { content: [{ type: 'text', text: `❌ ${matches.length} candidats — précisez :\n${matches.map(m => '  - ' + m).join('\n')}` }], isError: true };
+    target = `${dir}/${matches[0]}`;
+  }
+  const existing = await readNote(target);
+  if (existing == null) return { content: [{ type: 'text', text: `❌ "${target}" n'existe pas.` }], isError: true };
+  const { fm } = parseFrontmatter(existing);
+  fm.last_updated = nowIso();
+  if (args.add_tags?.length) {
+    const tags = Array.isArray(fm.tags) ? fm.tags : (fm.tags ? [fm.tags] : []);
+    for (const t of args.add_tags) if (!tags.includes(t)) tags.push(t);
+    fm.tags = tags;
+  }
+  const heading = args.title ? `# ${args.title}` : '';
+  const newContent = buildFrontmatter(fm) + (heading ? '\n' + heading + '\n\n' : '\n') + args.content + '\n';
+  await writeNote(target, newContent);
+  return { content: [{ type: 'text', text: `✓ Satellite mis à jour : ${target}` }] };
+});
+
+server.registerTool('delete_satellite', {
+  title: 'Delete a Claude satellite note',
+  description: 'SAFETY: only deletes inside _claude/.',
+  inputSchema: {
+    path: z.string().optional(),
+    repo: z.string().optional(),
+    slug: z.string().optional(),
+    confirm: z.boolean().optional(),
+  },
+}, async (args) => {
+  let target = args.path;
+  if (!target) {
+    if (!args.repo || !args.slug) return { content: [{ type: 'text', text: '❌ Fournir soit `path`, soit (`repo` + `slug`).' }], isError: true };
+    const { repo, settings } = await resolveRepo(args.repo);
+    const dir = `${settings.claudeFolder}/${repo.name}`;
+    let files = [];
+    try { files = await fs.readdir(safeVaultPath(dir)); }
+    catch { return { content: [{ type: 'text', text: `❌ Pas de dossier satellite pour ${repo.name}.` }], isError: true }; }
+    const needle = args.slug.toLowerCase();
+    const matches = files.filter(f => f.endsWith('.md') && f.toLowerCase().includes(needle));
+    if (matches.length === 0) return { content: [{ type: 'text', text: `❌ Aucun satellite ne matche "${args.slug}".\nFichiers : ${files.join(', ')}` }], isError: true };
+    if (matches.length > 1) return { content: [{ type: 'text', text: `❌ ${matches.length} candidats — préciser :\n${matches.map(m => '  - ' + m).join('\n')}` }], isError: true };
+    target = `${dir}/${matches[0]}`;
+  }
+  const norm = target.replace(/\\/g, '/');
+  if (!norm.includes('/_claude/') && !norm.includes('GalacticBrain/_claude')) {
+    return { content: [{ type: 'text', text: `❌ Refusé : delete_satellite ne supprime QUE des fichiers sous _claude/. Reçu : ${target}` }], isError: true };
+  }
+  if (!(await noteExists(target))) return { content: [{ type: 'text', text: `❌ "${target}" n'existe pas.` }], isError: true };
+  if (args.confirm !== true) {
+    return { content: [{ type: 'text', text: `⚠️ DRY-RUN : prêt à supprimer\n  ${target}\n\nRappeler avec confirm=true pour exécuter.` }] };
+  }
+  await deleteFile(target);
+  return { content: [{ type: 'text', text: `🗑 Satellite supprimé : ${target}` }] };
+});
+
+server.registerTool('list_satellites', {
+  title: 'List Claude satellite notes',
+  description: 'With date, kind, size. Filter by kind.',
+  inputSchema: {
+    repo: z.string(),
+    kind: z.string().optional(),
+    limit: z.number().int().min(1).max(50).optional(),
+  },
+}, async (args) => {
+  const { repo, settings } = await resolveRepo(args.repo);
+  const dir = `${settings.claudeFolder}/${repo.name}`;
+  let entries = [];
+  try {
+    const files = (await fs.readdir(safeVaultPath(dir))).filter(f => f.endsWith('.md'));
+    for (const f of files) {
+      const rel = `${dir}/${f}`;
+      const content = await readNote(rel);
+      if (!content) continue;
+      const { fm } = parseFrontmatter(content);
+      const stat = await fs.stat(safeVaultPath(rel));
+      entries.push({
+        file: f, path: rel, kind: fm.kind ?? 'note',
+        created: fm.created ?? null, bytes: stat.size,
+      });
+    }
+  } catch {
+    return { content: [{ type: 'text', text: `Aucun satellite Claude pour ${repo.name}.` }] };
+  }
+  if (entries.length === 0) return { content: [{ type: 'text', text: `Aucun satellite Claude pour ${repo.name}.` }] };
+  if (args.kind) entries = entries.filter(e => e.kind === args.kind);
+  entries.sort((a, b) => (b.created ?? '').localeCompare(a.created ?? ''));
+  const limited = entries.slice(0, args.limit ?? 20);
+  const lines = limited.map(e => {
+    const date = e.created?.slice(0, 10) ?? '?';
+    const kb = (e.bytes / 1024).toFixed(1);
+    return `- \`${e.file.replace(/\.md$/, '')}\`\n    ${date} · **${e.kind}** · ${kb} KB`;
+  });
+  const filterNote = args.kind ? ` (kind=${args.kind})` : '';
+  return { content: [{ type: 'text', text: `# ${entries.length} satellite(s) pour ${repo.name}${filterNote}\n\n${lines.join('\n')}\n\nFolder: ${dir}/` }] };
+});
+
+server.registerTool('vault_stats', {
+  title: 'Stats across the brain',
+  description: 'Counts by kind, total size, recent activity.',
+  inputSchema: {},
+}, async () => {
+  const data = await loadData();
+  const claudeBase = 'GalacticBrain/_claude';
+  let totalSatellites = 0, totalBytes = 0;
+  const byKind = {}, byRepo = {};
+  let latestCreated = '';
+  try {
+    const dirs = await fs.readdir(safeVaultPath(claudeBase));
+    for (const sub of dirs) {
+      const subRel = `${claudeBase}/${sub}`;
+      const stat = await fs.stat(safeVaultPath(subRel)).catch(() => null);
+      if (!stat?.isDirectory()) continue;
+      const files = (await fs.readdir(safeVaultPath(subRel)).catch(() => [])).filter(f => f.endsWith('.md'));
+      for (const f of files) {
+        const rel = `${subRel}/${f}`;
+        const content = await readNote(rel);
+        if (!content) continue;
+        const { fm } = parseFrontmatter(content);
+        const fst = await fs.stat(safeVaultPath(rel));
+        totalSatellites++;
+        totalBytes += fst.size;
+        byKind[fm.kind ?? 'note'] = (byKind[fm.kind ?? 'note'] ?? 0) + 1;
+        byRepo[sub] = (byRepo[sub] ?? 0) + 1;
+        if (fm.created && fm.created > latestCreated) latestCreated = fm.created;
+      }
+    }
+  } catch {}
+  const kindLines = Object.entries(byKind).sort((a, b) => b[1] - a[1])
+    .map(([k, n]) => `  - ${k} : ${n}`).join('\n');
+  const topRepos = Object.entries(byRepo).sort((a, b) => b[1] - a[1]).slice(0, 5)
+    .map(([r, n]) => `  - ${r} : ${n}`).join('\n');
+  return { content: [{ type: 'text', text:
+`# 🌌 Vault stats
+
+**Repos indexés** : ${data.repos.length}
+**Satellites Claude** : ${totalSatellites}  (${(totalBytes / 1024).toFixed(1)} KB)
+**Dernière activité** : ${latestCreated || 'jamais'}
+
+## Par kind
+${kindLines || '  (aucun)'}
+
+## Top repos par nombre de satellites
+${topRepos || '  (aucun)'}
+` }] };
+});
+
+server.registerTool('find_duplicates', {
+  title: 'Find satellites that look like duplicates',
+  description: 'Same kind + same date = likely duplicates.',
+  inputSchema: { repo: z.string().optional() },
+}, async (args) => {
+  const claudeBase = 'GalacticBrain/_claude';
+  let dirs;
+  try { dirs = await fs.readdir(safeVaultPath(claudeBase)); }
+  catch { return { content: [{ type: 'text', text: 'Aucun dossier _claude/ trouvé.' }] }; }
+  if (args.repo) dirs = dirs.filter(d => d === args.repo);
+  const groups = new Map();
+  for (const sub of dirs) {
+    const subRel = `${claudeBase}/${sub}`;
+    const stat = await fs.stat(safeVaultPath(subRel)).catch(() => null);
+    if (!stat?.isDirectory()) continue;
+    const files = (await fs.readdir(safeVaultPath(subRel)).catch(() => [])).filter(f => f.endsWith('.md'));
+    for (const f of files) {
+      const content = await readNote(`${subRel}/${f}`);
+      if (!content) continue;
+      const { fm } = parseFrontmatter(content);
+      const date = (fm.created ?? '').slice(0, 10);
+      const key = `${sub}|${date}|${fm.kind ?? 'note'}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(`${subRel}/${f}`);
+    }
+  }
+  const dupes = [...groups.entries()].filter(([_, v]) => v.length > 1);
+  if (dupes.length === 0) return { content: [{ type: 'text', text: '✓ Aucun doublon détecté.' }] };
+  const lines = dupes.map(([key, files]) => {
+    const [repo, date, kind] = key.split('|');
+    return `### ${repo} · ${date} · ${kind} (${files.length} fichiers)\n${files.map(f => '  - ' + f).join('\n')}`;
+  });
+  return { content: [{ type: 'text', text: `# Doublons probables\n\n${lines.join('\n\n')}\n\n_Utilise \`delete_satellite\` pour nettoyer._` }] };
+});
+
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error(`🌌 Galactic Brain MCP v${VERSION} connected (read + write + delete + update)`);
+  console.error(`   Vault : ${VAULT_RESOLVED}`);
+  console.error(`   Tools : 22 (12 read, 5 write, 1 update, 2 delete, 2 stats)`);
+}
+
+main().catch(e => {
+  console.error('Fatal:', e);
+  process.exit(1);
+});
+```
