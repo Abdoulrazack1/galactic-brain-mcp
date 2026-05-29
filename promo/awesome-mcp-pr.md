@@ -1,4 +1,15 @@
-# Pull Request — wong2/awesome-mcp-servers
+# ⚠️ OBSOLÈTE — Voir mcpservers-submission.md
+
+> Le repo `wong2/awesome-mcp-servers` **n'accepte plus de PRs**. Note explicite en haut de leur README :
+> > *We do not accept PRs. Please submit your MCP on the website: https://mcpservers.org/submit*
+>
+> ➡️ La voie officielle est désormais : **[mcpservers-submission.md](./mcpservers-submission.md)**
+>
+> Ce fichier est conservé pour archive historique.
+
+---
+
+# (Archive) — Procédure PR ancienne version
 
 **Repo cible :** https://github.com/wong2/awesome-mcp-servers
 **Action :** Fork → édit `README.md` → PR
