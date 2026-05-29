@@ -1,16 +1,36 @@
 # 🌌 Galactic Brain MCP
 
-> **Le cerveau** de Galactic Brain — serveur MCP Node.js qui expose **114 outils** de mémoire et de raisonnement à Claude Desktop / Claude Code.
+> **Fatigué que Claude oublie le contexte entre deux sessions ?**
+> Galactic Brain transforme ton vault Obsidian en **mémoire augmentée** pour Claude Desktop et Claude Code, avec **114 outils** de raisonnement, recherche et synthèse.
 
 [![Node](https://img.shields.io/badge/node-%E2%89%A520-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![MCP](https://img.shields.io/badge/MCP-%40modelcontextprotocol%2Fsdk-7c5cff)](https://modelcontextprotocol.io/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![Obsidian](https://img.shields.io/badge/Obsidian-7C3AED?logo=obsidian&logoColor=white)](https://obsidian.md/)
+[![Claude](https://img.shields.io/badge/Claude-Desktop%20%2F%20Code-D97757)](https://claude.ai/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+<!-- 📽️ GIF/Démo à ajouter ici : 10-15s montrant Claude Desktop appelant brain_brief ou brain_advise et retournant un rapport multi-source. Drag-drop dans GitHub → coller le lien Markdown ici. -->
+
+---
+
+## 🚀 Ce que tu peux faire avec Galactic Brain MCP
+
+| Avant | Avec Galactic Brain |
+|---|---|
+| « Claude, j'ai bossé sur X la semaine dernière, tu te souviens ? » | `brain_brief depth:full` → rapport situation en 1 call : commits, décisions, deadlines, threads stalled |
+| « Est-ce que cette décision est cohérente avec ce que j'ai dit avant ? » | `brain_advise decision:"..."` → verdict GO/CAUTION/NO-GO + contradictions détectées |
+| « Aide-moi à planifier mon sprint à partir de mes notes » | `sprint_plan` ou `brain_chain` — raisonnement séquentiel multi-étapes sur ton vault |
+| « Quels sont les risques que je n'ai pas vus ? » | `brain_critic` — avocat du diable adversarial sur ton plan |
+| « Anticipe ma semaine » | `brain_foresee` — deadlines à risque, threads qui meurent, décisions overdue |
+
+**Pas une démo.** ~5900 lignes, 14 versions livrées en 2 semaines, utilisé quotidiennement.
+
+---
 
 ## 🧠 Qu'est-ce que c'est
 
 Galactic Brain MCP est un serveur [Model Context Protocol](https://modelcontextprotocol.io/) qui transforme un vault Obsidian en **mémoire augmentée** pour Claude. Il indexe tes repos GitHub, tes notes, tes décisions, ton time-log, et expose tout ça via **114 outils** — recherche, raisonnement, anticipation, stress-test de décisions, synthèse multi-source, et plus.
-
-**Pas une démo.** ~5900 lignes, 14 versions livrées en 2 semaines, utilisé quotidiennement.
 
 ## 🏗️ Architecture en 4 couches
 
@@ -48,6 +68,8 @@ Galactic Brain MCP est un serveur [Model Context Protocol](https://modelcontextp
 └─────────────────────────────────────────────────────────────┘
 ```
 
+Chaque couche apporte une capacité distincte : v5–v11 fournit la **mémoire brute** (notes, search, time-log), v12 ajoute la **calibration adaptative**, v13 introduit l'**apprentissage** des routings stables, v14 livre la **synthèse cognitive** (1 call multi-outils), et v14.1 boucle la **boucle auto-sync** entre Claude Code et le vault.
+
 ## 🌟 Quelques outils marquants
 
 ### `brain_brief` — Situation report proactif
@@ -65,7 +87,7 @@ Projette : deadlines à risque, threads stalled qui meurent, contexte qui se per
 ### `brain_critic` — Avocat du diable
 Soumets un plan, je l'attaque depuis tous les angles : faiblesses, suppositions cachées, contradictions, alternatives ignorées.
 
-## 📦 Installation
+## 📦 Quick Start
 
 ### Prérequis
 
@@ -74,7 +96,7 @@ Soumets un plan, je l'attaque depuis tous les angles : faiblesses, suppositions 
 - [Claude Desktop](https://claude.ai/download) ou Claude Code
 - Le [plugin Obsidian Galactic Brain](#) (génère `_mcp_export.json` dans le vault)
 
-### Setup
+### Installation (3 commandes)
 
 ```bash
 git clone https://github.com/Abdoulrazack1/galactic-brain-mcp.git
@@ -101,7 +123,7 @@ npm install
 }
 ```
 
-Redémarre Claude Desktop. Les 114 outils apparaissent.
+Redémarre Claude Desktop. Les **114 outils** apparaissent dans le menu MCP.
 
 ## 🔁 Activer l'auto-sync (v14.1)
 
@@ -191,9 +213,19 @@ galactic-brain-mcp/
 | API payantes | **0** |
 | Dépendances runtime | 2 (`@mcp/sdk`, `zod`) |
 
+## 🆚 Pourquoi pas un autre serveur MCP ?
+
+| Solution | Outils | Mémoire persistante | Apprentissage | API payante |
+|---|---|---|---|---|
+| **Galactic Brain MCP** | **114** | ✅ Vault Obsidian git-versionné | ✅ Cache routings | ❌ 0 |
+| `mcp-server-memory` officiel | ~10 | ⚠️ JSON local | ❌ | ❌ |
+| Mem0 / Letta | variable | ✅ | ✅ | ✅ payant |
+
+Le choix d'Obsidian comme storage = **portabilité totale** (markdown), versioning gratuit (git), et un client de lecture/édition déjà excellent.
+
 ## 🤝 Contribuer
 
-C'est un projet personnel, mais les issues / PRs sont bienvenus si tu veux ajouter un outil ou améliorer l'existant.
+Voir [CONTRIBUTING.md](CONTRIBUTING.md). C'est un projet personnel, mais issues et PRs sont bienvenues — ajout d'un outil, fix d'un bug BM25, amélioration de la consolidation, port macOS/Linux pour Task Scheduler, etc.
 
 ## 📜 Licence
 
@@ -203,4 +235,5 @@ MIT. Fais-en ce que tu veux.
 
 - **Vault de mémoire** (privé) : `galactic-brain-vault`
 - **Plugin Obsidian** : à publier
+- **Liste de serveurs MCP** : [awesome-mcp-servers](https://github.com/wong2/awesome-mcp-servers)
 - **Auteur** : [@Abdoulrazack1](https://github.com/Abdoulrazack1)
