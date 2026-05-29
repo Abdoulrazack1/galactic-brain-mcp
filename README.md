@@ -1,5 +1,7 @@
 # 🌌 Galactic Brain MCP
 
+[![Galactic Brain MCP — 114 tools, 5 layers, persistent memory for Claude Desktop](screenshots/banner.png)](screenshots/banner.png)
+
 > **Fatigué que Claude oublie le contexte entre deux sessions ?**
 > Galactic Brain transforme ton vault Obsidian en **mémoire augmentée** pour Claude Desktop et Claude Code, avec **114 outils** de raisonnement, recherche et synthèse.
 
